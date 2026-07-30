@@ -761,10 +761,9 @@ private struct MinimalisticReminderDetailsView: View {
     // MARK: - Progress Bar (Full Width)
     
     @ObservedObject var musicManager = MusicManager.shared
-    @State private var sliderValue: Double = MusicManager.shared.estimatedPlaybackPosition()
-    @State private var dragging: Bool = false
-    @State private var lastDragged: Date = .distantPast
-    
+    // No slider state here on purpose: MusicSliderView derives its own position, so
+    // a TimelineView tick no longer invalidates this ~1200-line view's body.
+
     /// Whether the progress timeline should be paused (no ticks).
     private var isProgressTimelinePaused: Bool {
         !musicManager.isPlaying || musicManager.isLiveStream || musicManager.playbackRate <= 0
@@ -777,14 +776,8 @@ private struct MinimalisticReminderDetailsView: View {
             )
         ) { timeline in
             MusicSliderView(
-                sliderValue: $sliderValue,
-                duration: Binding(
-                    get: { musicManager.songDuration },
-                    set: { musicManager.songDuration = $0 }
-                ),
-                lastDragged: $lastDragged,
+                duration: musicManager.songDuration,
                 color: musicManager.avgColor,
-                dragging: $dragging,
                 currentDate: timeline.date,
                 timestampDate: musicManager.timestampDate,
                 elapsedTime: musicManager.elapsedTime,
@@ -799,15 +792,6 @@ private struct MinimalisticReminderDetailsView: View {
                 restingTrackHeight: 7,
                 draggingTrackHeight: 11
             )
-        }
-        .onAppear {
-            sliderValue = musicManager.elapsedTime
-        }
-        .onChange(of: musicManager.isLiveStream) { _, isLive in
-            if isLive {
-                dragging = false
-                sliderValue = 0
-            }
         }
     }
 
@@ -1258,7 +1242,7 @@ struct MinimalisticAlbumArtView: View {
             .opacity(
                 usesLiveCanvasArtwork
                     ? (musicManager.isPlaying ? 0.35 : 0.12)
-                    : min(0.28, 1 - max(musicManager.albumArt.getBrightness(), 0.3))
+                    : min(0.28, 1 - max(musicManager.albumArtBrightness, 0.3))
             )
             .shadow(
                 color: Color(nsColor: musicManager.avgColor).opacity(usesLiveCanvasArtwork ? 0.14 : 0.08),

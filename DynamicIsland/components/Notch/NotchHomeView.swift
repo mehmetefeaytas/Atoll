@@ -278,9 +278,8 @@ struct MusicControlsView: View {
     @EnvironmentObject var vm: DynamicIslandViewModel
     @ObservedObject var musicManager = MusicManager.shared
     @ObservedObject var coordinator = DynamicIslandViewCoordinator.shared
-    @State private var sliderValue: Double = MusicManager.shared.estimatedPlaybackPosition()
-    @State private var dragging: Bool = false
-    @State private var lastDragged: Date = .distantPast
+    // No slider state here on purpose: MusicSliderView owns and derives its own
+    // position, so a TimelineView tick no longer re-renders this whole view.
     @State private var hudValue: Double = 0
     @State private var hudDragging: Bool = false
     @State private var hudLastDragged: Date = .distantPast
@@ -379,11 +378,8 @@ struct MusicControlsView: View {
     private var musicSlider: some View {
         TimelineView(.animation(paused: isProgressTimelinePaused)) { timeline in
             MusicSliderView(
-                sliderValue: $sliderValue,
-                duration: $musicManager.songDuration,
-                lastDragged: $lastDragged,
+                duration: musicManager.songDuration,
                 color: musicManager.avgColor,
-                dragging: $dragging,
                 currentDate: timeline.date,
                 timestampDate: musicManager.timestampDate,
                 elapsedTime: musicManager.elapsedTime,
@@ -762,12 +758,18 @@ struct NotchHomeView: View {
     }
 }
 
+/// Playback progress slider.
+///
+/// The displayed position is **derived** from `currentDate`, not stored. It used to
+/// live in a `@State` owned by the *parent*, written from `.onChange(of: currentDate)`
+/// — so every `TimelineView(.animation)` tick (up to 120 Hz on ProMotion) invalidated
+/// the whole enclosing music panel: marquee title/artist/lyrics, the control-slot
+/// row, and several `Defaults` reads that decode Codable payloads. A `TimelineView`
+/// tick does not invalidate the parent by itself; only writing to the parent's state
+/// does. Keeping the value local and computed removes that entirely.
 struct MusicSliderView: View {
-    @Binding var sliderValue: Double
-    @Binding var duration: Double
-    @Binding var lastDragged: Date
+    let duration: Double
     var color: NSColor
-    @Binding var dragging: Bool
     let currentDate: Date
     let timestampDate: Date
     let elapsedTime: Double
@@ -790,6 +792,43 @@ struct MusicSliderView: View {
         case remaining
     }
 
+    @State private var dragging: Bool = false
+    /// Live value while the user drags the knob.
+    @State private var dragValue: Double = 0
+    /// Value we seeked to, held until the player reports a position that reflects it.
+    @State private var pendingSeek: Double?
+    @State private var lastDragged: Date = .distantPast
+
+    /// The position to draw. No stored state, so nothing to keep in sync — and the
+    /// pause case can no longer coast past the true value, because
+    /// `estimatedPosition` collapses to `min(elapsedTime, duration)` once
+    /// `isPlaying` is false.
+    private var displayedValue: Double {
+        if isLiveStream { return 0 }
+        if dragging { return dragValue }
+        // Held until the player catches up; cleared in .onChange(of: elapsedTime).
+        if let pendingSeek { return pendingSeek }
+        return estimatedPosition
+    }
+
+    /// Mirrors `MusicManager.estimatedPlaybackPosition(at:)`, but derived from the
+    /// values passed in rather than read off the singleton. That keeps `elapsedTime`,
+    /// `playbackRate`, `timestampDate` and `isPlaying` genuinely *read* by this view:
+    /// with the timeline paused they are the only inputs whose change re-evaluates
+    /// the body, which is what makes the position snap correctly on pause.
+    private var estimatedPosition: Double {
+        guard isPlaying, playbackRate > 0 else { return min(elapsedTime, duration) }
+        let elapsedSinceReport = currentDate.timeIntervalSince(timestampDate)
+        return min(max(0, elapsedTime + elapsedSinceReport * playbackRate), duration)
+    }
+
+    private var sliderBinding: Binding<Double> {
+        Binding(
+            get: { displayedValue },
+            set: { dragValue = $0 }
+        )
+    }
+
     var body: some View {
         Group {
             if isLiveStream {
@@ -803,35 +842,30 @@ struct MusicSliderView: View {
                 }
             }
         }
-        .onAppear {
-            guard !isLiveStream else { return }
-            guard !dragging else { return }
-            setSliderValueWithoutAnimation(MusicManager.shared.estimatedPlaybackPosition())
-        }
-        .onChange(of: currentDate) { newDate in
-            guard !isLiveStream else { return }
-            guard !dragging, timestampDate.timeIntervalSince(lastDragged) > -1 else { return }
-            setSliderValueWithoutAnimation(MusicManager.shared.estimatedPlaybackPosition(at: newDate))
-        }
-        .onChange(of: isPlaying) { _, playing in
-            // Snap slider to the exact position when music pauses so
-            // the in-flight animation doesn't coast past the true value.
-            if !playing {
-                sliderValue = MusicManager.shared.estimatedPlaybackPosition()
+        // Release the seek hold once the player reports a position that reflects it,
+        // or any position newer than the drag. Without an explicit release the hold
+        // would latch forever and re-surface on a later track: `timestampDate` is not
+        // monotonic across controller switches (NowPlayingController carries
+        // `lastUpdated` forward), so a purely timestamp-based predicate can re-engage
+        // long after the seek. `elapsedTime` only changes on a player publish, so this
+        // is event-driven, not per-frame.
+        .onChange(of: elapsedTime) { _ in
+            guard let target = pendingSeek else { return }
+            if timestampDate > lastDragged || abs(elapsedTime - target) < 1.5 {
+                pendingSeek = nil
             }
+        }
+        // Track change: drop any stale hold so the new song never inherits the old
+        // song's seek position.
+        .onChange(of: duration) { _ in
+            pendingSeek = nil
+            lastDragged = .distantPast
         }
         .onChange(of: isLiveStream) { isLive in
             if isLive {
-                sliderValue = 0
+                pendingSeek = nil
+                dragging = false
             }
-        }
-    }
-
-    private func setSliderValueWithoutAnimation(_ value: Double) {
-        var transaction = Transaction()
-        transaction.disablesAnimations = true
-        withTransaction(transaction) {
-            sliderValue = value
         }
     }
 
@@ -841,7 +875,7 @@ struct MusicSliderView: View {
                 .frame(height: sliderFrameHeight)
 
             HStack {
-                Text(timeString(from: sliderValue))
+                Text(timeString(from: displayedValue))
                 Spacer()
                 Text(trailingTimeText)
             }
@@ -853,7 +887,7 @@ struct MusicSliderView: View {
 
     private var inlineContent: some View {
         HStack(spacing: 6) {
-            Text(timeString(from: sliderValue))
+            Text(timeString(from: displayedValue))
                 .font(inlineLabelFont)
                 .foregroundColor(timeLabelColor)
                 .frame(width: 36, alignment: .leading)
@@ -893,15 +927,26 @@ struct MusicSliderView: View {
 
     private var sliderCore: some View {
         CustomSlider(
-            value: $sliderValue,
+            value: sliderBinding,
             range: 0 ... duration,
             color: sliderTint,
             dragging: $dragging,
             lastDragged: $lastDragged,
-            onValueChange: onValueChange,
+            onValueChange: { newValue in
+                // Start holding the seeked value before the seek round-trips through
+                // the media controller, otherwise the slider snaps back for a frame.
+                pendingSeek = newValue
+                onValueChange(newValue)
+            },
             restingTrackHeight: restingTrackHeight,
             draggingTrackHeight: draggingTrackHeight
         )
+        // The position used to be written inside a Transaction(disablesAnimations:)
+        // so the filled track never interpolated. Now that it is derived, it would
+        // otherwise inherit whatever transaction is ambient when the body re-runs —
+        // and MusicManager republishes inside withAnimation(.smooth), so on a track
+        // change the bar would slide from full back to zero instead of snapping.
+        .transaction { $0.disablesAnimations = true }
     }
 
     private var sliderTint: Color {//
@@ -926,7 +971,7 @@ struct MusicSliderView: View {
         case .duration:
             return timeString(from: duration)
         case .remaining:
-            let remaining = max(duration - sliderValue, 0)
+            let remaining = max(duration - displayedValue, 0)
             return "-" + timeString(from: remaining)
         }
     }

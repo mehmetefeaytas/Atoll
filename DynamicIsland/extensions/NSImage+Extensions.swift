@@ -329,6 +329,15 @@ extension NSImage {
         }
     }
     
+    /// Reused across calls: allocating a `CIContext` is expensive and this used to
+    /// build a fresh one every time, from inside a SwiftUI body.
+    private static let sharedBrightnessContext = CIContext(options: nil)
+
+    /// Average luminance of the image, 0...1.
+    ///
+    /// Full-resolution CoreImage work — do not call from a view body. `MusicManager`
+    /// computes it once per artwork change off the main thread and publishes
+    /// `albumArtBrightness`; read that instead.
     func getBrightness() -> CGFloat {
         guard let cgImage = self.cgImage(forProposedRect: nil, context: nil, hints: nil) else {
             return 0
@@ -343,11 +352,9 @@ extension NSImage {
         guard let outputImage = filter.outputImage else {
             return 0
         }
-        
-        let context = CIContext(options: nil)
-        
+
         var bitmap = [UInt8](repeating: 0, count: 4)
-        context.render(outputImage,
+        Self.sharedBrightnessContext.render(outputImage,
                        toBitmap: &bitmap,
                        rowBytes: 4,
                        bounds: CGRect(x: 0, y: 0, width: 1, height: 1),

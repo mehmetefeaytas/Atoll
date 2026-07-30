@@ -553,6 +553,10 @@ struct ContentView: View {
         installRootLifecycleHandlers(on: rootBodyView)
     }
 
+    private var shadowIsVisible: Bool {
+        (vm.notchState == .open || isHovering) && Defaults[.enableShadow]
+    }
+
     private var mainLayoutBase: some View {
         NotchLayout()
             .frame(alignment: .top)
@@ -560,12 +564,24 @@ struct ContentView: View {
             .padding([.horizontal, .bottom], vm.notchState == .open ? 12 : 0)
             .background(.black)
             .clipShape(resolvedClipShape)
+            // compositingGroup stays unconditional: the open/close
+            // .transition(.blurReplace) and animations applied downstream in
+            // configuredMainLayout need the notch flattened, or they composite
+            // per child layer and cross-fade with visible overlap artifacts.
+            //
+            // The shadow *radius* is what got gated. Previously only the colour went
+            // .clear while the radius stayed at 10 — so every frame anything inside
+            // changed (spectrum at 30fps, progress slider, marquee scroll) ran a
+            // 10pt gaussian blur pass whose result was fully transparent.
+            //
+            // Deliberately not wrapped in a conditionalModifier: that is a
+            // @ViewBuilder if/else, so toggling it would change the structural
+            // identity of the whole notch subtree — resetting every child @State and
+            // re-registering the "albumArt"/"spectrum" matchedGeometryEffect pairs.
             .compositingGroup()
             .shadow(
-                color: ((vm.notchState == .open || isHovering) && Defaults[.enableShadow])
-                    ? .black.opacity(0.6)
-                    : .clear,
-                radius: Defaults[.cornerRadiusScaling] ? 10 : 5
+                color: shadowIsVisible ? .black.opacity(0.6) : .clear,
+                radius: shadowIsVisible ? (Defaults[.cornerRadiusScaling] ? 10 : 5) : 0
             )
             // Extra horizontal inset for Dynamic Island mode so the shadow
             // is not clipped by the outer frame constraint

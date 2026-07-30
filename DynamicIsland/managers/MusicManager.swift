@@ -463,6 +463,9 @@ class MusicManager: ObservableObject {
     @Published var songTitle: String = "I'm Handsome"
     @Published var artistName: String = "Me"
     @Published var albumArt: NSImage = defaultImage
+    /// Average luminance of `albumArt`, 0...1. Computed off-main once per artwork
+    /// change so views never run CoreImage from their body.
+    @Published private(set) var albumArtBrightness: CGFloat = 0.5
     @Published var isPlaying = false
     @Published var album: String = "Self Love"
     @Published var isPlayerIdle: Bool = true
@@ -1126,8 +1129,33 @@ class MusicManager: ObservableObject {
                     self?.calculateAverageColor()
                 }
             }
+            // Not inside the coloredSpectrogram branch: brightness drives the
+            // minimalistic lighting effect, which is independent of that setting.
+            self?.updateAlbumArtBrightness(for: newAlbumArt)
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.4, execute: workItem!)
+    }
+
+    /// Computes the artwork's average luminance once per track, off the main thread.
+    ///
+    /// `MinimalisticAlbumArtView` used to call `albumArt.getBrightness()` straight
+    /// from its body — a full-resolution CoreImage `areaAverage` pass, synchronously
+    /// on the main thread, on every one of this object's publishes.
+    private func updateAlbumArtBrightness(for artwork: NSImage) {
+        DispatchQueue.global(qos: .userInitiated).async {
+            let brightness = artwork.getBrightness()
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                // Two passes can be in flight for consecutive tracks, and a large
+                // artwork can finish after a small one — so only accept the result
+                // if it still describes the artwork currently on screen.
+                guard self.albumArt === artwork else { return }
+                guard self.albumArtBrightness != brightness else { return }
+                withAnimation(.smooth) {
+                    self.albumArtBrightness = brightness
+                }
+            }
+        }
     }
 
     // MARK: - Playback Position Estimation

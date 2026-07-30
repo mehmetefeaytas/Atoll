@@ -40,9 +40,8 @@ struct LockScreenMusicPanel: View {
     @StateObject private var volumeModel = MediaOutputVolumeViewModel()
     @ObservedObject private var airPlayManager = AppleMusicAirPlayManager.shared
     @ObservedObject private var animator: LockScreenPanelAnimator
-    @State private var sliderValue: Double = 0
-    @State private var dragging: Bool = false
-    @State private var lastDragged: Date = .distantPast
+    // No slider state here on purpose: MusicSliderView derives its own position, so
+    // a TimelineView tick no longer invalidates this whole panel.
     @State private var isActive = true
     @State private var isExpanded = false
     @State private var isVolumeSliderVisible = false
@@ -177,7 +176,6 @@ struct LockScreenMusicPanel: View {
         .animation(.easeInOut(duration: 0.28), value: isExpanded)
         .animation(.easeInOut(duration: 0.24), value: shouldShowVolumeSlider)
         .onAppear {
-            sliderValue = musicManager.elapsedTime
             isActive = true
             logPanelAppearance()
             updatePanelSize(animated: false)
@@ -539,14 +537,8 @@ struct LockScreenMusicPanel: View {
             )
         ) { timeline in
             MusicSliderView(
-                sliderValue: $sliderValue,
-                duration: Binding(
-                    get: { musicManager.songDuration },
-                    set: { musicManager.songDuration = $0 }
-                ),
-                lastDragged: $lastDragged,
+                duration: musicManager.songDuration,
                 color: musicManager.avgColor,
-                dragging: $dragging,
                 currentDate: timeline.date,
                 timestampDate: musicManager.timestampDate,
                 elapsedTime: musicManager.elapsedTime,
@@ -562,15 +554,6 @@ struct LockScreenMusicPanel: View {
                 restingTrackHeight: 7,
                 draggingTrackHeight: 11
             )
-        }
-        .onAppear {
-            sliderValue = musicManager.elapsedTime
-        }
-        .onChange(of: musicManager.isLiveStream) { _, isLive in
-            if isLive {
-                dragging = false
-                sliderValue = 0
-            }
         }
     }
 
