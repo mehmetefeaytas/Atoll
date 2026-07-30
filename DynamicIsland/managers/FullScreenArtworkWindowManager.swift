@@ -822,6 +822,10 @@ final class FullScreenArtworkWindowManager: ObservableObject {
         return String(hasher.finalize())
     }
 
+    /// Reused across calls: a `CIContext` owns a Metal command queue and its own
+    /// intermediate caches, and this used to allocate a fresh one on every track change.
+    private static let sharedWallpaperBlurContext = CIContext(options: nil)
+
     private func encodeBlurredWallpaperPNG(from artwork: NSImage, targetPixelSize: CGSize) -> Data? {
         guard let tiffData = artwork.tiffRepresentation,
               let sourceImage = CIImage(data: tiffData)
@@ -858,31 +862,54 @@ final class FullScreenArtworkWindowManager: ObservableObject {
                 ]
             )
 
-        let context = CIContext(options: nil)
-        guard let cgImage = context.createCGImage(blurredImage, from: targetRect) else { return nil }
+        guard let cgImage = Self.sharedWallpaperBlurContext.createCGImage(blurredImage, from: targetRect) else { return nil }
 
-        let renderedImage = NSImage(cgImage: cgImage, size: NSSize(width: targetPixelSize.width, height: targetPixelSize.height))
-        let composedImage = NSImage(size: renderedImage.size)
+        // `targetPixelSize` is in pixels, but `NSImage.size` and `lockFocus()` work in
+        // points: wrapping the render in an NSImage made AppKit multiply the backing
+        // store by the screen's scale factor a second time, so a 2560x1664 request
+        // allocated 5120x3328 on Retina (and the TIFF round-trip copied that twice more).
+        // Composing into an explicitly sized bitmap pins one point to one pixel, and the
+        // rep can hand back PNG bytes directly. It also makes the output deterministic:
+        // `lockFocus()` adopted the main display's profile, so the same artwork encoded
+        // to a differently tagged file per display while the cache key ignored that.
+        let pixelsWide = max(Int(targetPixelSize.width.rounded()), 1)
+        let pixelsHigh = max(Int(targetPixelSize.height.rounded()), 1)
 
-        composedImage.lockFocus()
-        renderedImage.draw(in: NSRect(origin: .zero, size: renderedImage.size))
+        guard let composedRep = NSBitmapImageRep(
+            bitmapDataPlanes: nil,
+            pixelsWide: pixelsWide,
+            pixelsHigh: pixelsHigh,
+            bitsPerSample: 8,
+            samplesPerPixel: 4,
+            hasAlpha: true,
+            isPlanar: false,
+            colorSpaceName: .deviceRGB,
+            bytesPerRow: 0,
+            bitsPerPixel: 0
+        ) else { return nil }
+
+        composedRep.size = NSSize(width: pixelsWide, height: pixelsHigh)
+
+        guard let graphicsContext = NSGraphicsContext(bitmapImageRep: composedRep) else { return nil }
+
+        let composedRect = NSRect(x: 0, y: 0, width: pixelsWide, height: pixelsHigh)
+
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = graphicsContext
+        graphicsContext.cgContext.draw(cgImage, in: composedRect)
 
         NSColor(calibratedWhite: 0.02, alpha: 0.08).setFill()
-        NSBezierPath(rect: NSRect(origin: .zero, size: renderedImage.size)).fill()
+        NSBezierPath(rect: composedRect).fill()
 
         let gradient = NSGradient(colors: [
             NSColor.white.withAlphaComponent(0.05),
             NSColor.clear,
             NSColor.black.withAlphaComponent(0.16)
         ])
-        gradient?.draw(in: NSRect(origin: .zero, size: renderedImage.size), angle: -90)
-        composedImage.unlockFocus()
+        gradient?.draw(in: composedRect, angle: -90)
+        NSGraphicsContext.restoreGraphicsState()
 
-        guard let finalTIFF = composedImage.tiffRepresentation,
-              let finalBitmap = NSBitmapImageRep(data: finalTIFF)
-        else { return nil }
-
-        return finalBitmap.representation(using: .png, properties: [:])
+        return composedRep.representation(using: .png, properties: [:])
     }
 
     private func applyDeferredStaticFallback() {
