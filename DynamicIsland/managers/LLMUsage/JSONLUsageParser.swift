@@ -26,8 +26,24 @@ struct JSONLUsageParser {
         return isoPlain.date(from: s)
     }
 
-    static func parseLine(_ line: String) -> UsageRecord? {
-        guard let data = line.data(using: .utf8),
+    /// Raw bytes of the only key that can yield a record. Lines without it are
+    /// skipped before JSONSerialization ever builds a dictionary tree for them —
+    /// most transcript lines are user turns or tool results with no usage block,
+    /// and their `content` fields are the bulk of the file.
+    private static let usageNeedle = Array("\"usage\"".utf8)
+
+    private static func containsUsage(_ data: Data) -> Bool {
+        guard data.count >= usageNeedle.count else { return false }
+        return data.withUnsafeBytes { haystack -> Bool in
+            guard let base = haystack.baseAddress else { return false }
+            return usageNeedle.withUnsafeBufferPointer { needle in
+                memmem(base, haystack.count, needle.baseAddress!, needle.count) != nil
+            }
+        }
+    }
+
+    static func parseLine(_ data: Data) -> UsageRecord? {
+        guard containsUsage(data),
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
         let message = obj["message"] as? [String: Any]
         let usage = (message?["usage"] as? [String: Any]) ?? (obj["usage"] as? [String: Any])
@@ -54,7 +70,18 @@ struct JSONLUsageParser {
         let sessionStart = now.addingTimeInterval(-5 * 3600)
         let weekStart = now.addingTimeInterval(-7 * 86400)
 
+        // A JSONL transcript is append-only, so a file whose last write predates the
+        // aggregation window cannot hold a record inside it. Without this the parser
+        // walked every transcript ever written (~1800 files / GBs here) on every
+        // refresh just to keep the last seven days, allocating a JSON object tree per
+        // line and pushing the process past 6 GB.
+        let mtimeCutoff = weekStart.addingTimeInterval(-3600)
+
         for file in files {
+            if let mtime = try? file.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate,
+               mtime < mtimeCutoff {
+                continue
+            }
             // Stream the file line-by-line instead of loading the whole JSONL log
             // (potentially many MB) into a String plus a full array of substrings.
             enumerateLines(of: file) { line in
@@ -88,34 +115,33 @@ struct JSONLUsageParser {
     /// Reads a file in fixed-size chunks and invokes `handler` once per non-empty
     /// line, without ever holding the entire file in memory. Runs synchronously on
     /// the caller's thread (aggregation already happens off the main thread).
-    private static func enumerateLines(of file: URL, _ handler: (String) -> Void) {
+    private static func enumerateLines(of file: URL, _ handler: (Data) -> Void) {
         guard let fh = try? FileHandle(forReadingFrom: file) else { return }
         defer { try? fh.close() }
 
-        let chunkSize = 1 << 16 // 64 KB
-        let newline = UInt8(0x0A)
-        var buffer = Data()
+        let chunkSize = 1 << 18 // 256 KB
+        // A plain byte array, scanned with memchr. Slicing Data and calling
+        // firstIndex(of:) routed every single byte through __DataStorage's
+        // _bytes/_offset accessors, which dominated the profile.
+        var buffer = [UInt8]()
 
         while let chunk = try? fh.read(upToCount: chunkSize), !chunk.isEmpty {
-            buffer.append(chunk)
-            // Scan the whole chunk advancing a cursor, then trim the consumed
-            // prefix once. The previous per-line removeSubrange shifted the rest
-            // of the buffer for every newline → quadratic on newline-dense JSONL.
-            var searchStart = buffer.startIndex
-            while let newlineIndex = buffer[searchStart...].firstIndex(of: newline) {
-                let lineData = buffer[searchStart..<newlineIndex]
-                if !lineData.isEmpty, let line = String(data: lineData, encoding: .utf8) {
-                    handler(line)
+            buffer.append(contentsOf: chunk)
+            var consumed = 0
+            buffer.withUnsafeBufferPointer { buf in
+                guard let base = buf.baseAddress else { return }
+                while consumed < buf.count {
+                    guard let hit = memchr(base + consumed, 0x0A, buf.count - consumed) else { break }
+                    let newlineIndex = UnsafeRawPointer(hit) - UnsafeRawPointer(base)
+                    if newlineIndex > consumed {
+                        handler(Data(bytes: base + consumed, count: newlineIndex - consumed))
+                    }
+                    consumed = newlineIndex + 1
                 }
-                searchStart = buffer.index(after: newlineIndex)
             }
-            if searchStart != buffer.startIndex {
-                buffer.removeSubrange(buffer.startIndex..<searchStart)
-            }
+            if consumed > 0 { buffer.removeFirst(consumed) }
         }
 
-        if !buffer.isEmpty, let line = String(data: buffer, encoding: .utf8) {
-            handler(line)
-        }
+        if !buffer.isEmpty { handler(Data(buffer)) }
     }
 }
