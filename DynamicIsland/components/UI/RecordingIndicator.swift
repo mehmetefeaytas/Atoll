@@ -147,6 +147,10 @@ struct RecordingIndicatorLarge: View {
                         isPulsing = true
                     }
                 }
+                .onDisappear {
+                    // Stop the repeatForever pulse, mirroring the primary indicator.
+                    withAnimation(.easeInOut(duration: 0.2)) { isPulsing = false }
+                }
                 .transition(.asymmetric(
                     insertion: .scale.combined(with: .opacity),
                     removal: .scale.combined(with: .opacity)
@@ -174,6 +178,9 @@ struct RecordingIndicatorSubtle: View {
                         withAnimation(.easeInOut(duration: 1.0).repeatForever(autoreverses: true)) {
                             opacity = 1.0
                         }
+                    }
+                    .onDisappear {
+                        withAnimation(.easeInOut(duration: 0.2)) { opacity = 0.5 }
                     }
                     .transition(.opacity)
             }

@@ -92,5 +92,11 @@ struct PulsingModifier: ViewModifier {
                     isPulsing = true
                 }
             }
+            .onDisappear {
+                // A .repeatForever animation keeps driving its property after the view
+                // is gone, and re-appearing would find isPulsing already true — so the
+                // withAnimation above becomes a no-op and the pulse never restarts.
+                withAnimation(.easeInOut(duration: 0.2)) { isPulsing = false }
+            }
     }
 }

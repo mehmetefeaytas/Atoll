@@ -110,8 +110,13 @@ struct PrivacyIndicatorIcon: View {
         .onAppear {
             startPulseAnimation()
         }
+        .onDisappear {
+            // Without this the .repeatForever pulse below keeps animating after the
+            // indicator goes away, and a second appearance never restarts it.
+            stopPulseAnimation()
+        }
     }
-    
+
     // MARK: - Animation
     private func startPulseAnimation() {
         withAnimation(
@@ -119,6 +124,12 @@ struct PrivacyIndicatorIcon: View {
             .repeatForever(autoreverses: true)
         ) {
             isAnimating = true
+        }
+    }
+
+    private func stopPulseAnimation() {
+        withAnimation(.easeInOut(duration: 0.2)) {
+            isAnimating = false
         }
     }
 }

@@ -86,13 +86,9 @@ struct CustomIdleAnimation: Codable, Hashable, Equatable, Defaults.Serializable,
     
     /// Get the effective transform config (override or default)
     func getTransformConfig() -> AnimationTransformConfig {
-        let override = Defaults[.animationTransformOverrides][id.uuidString]
-        if let override = override {
-            print("📋 [CustomIdleAnimation] Found override for '\(name)': \(override)")
-        } else {
-            print("📋 [CustomIdleAnimation] No override for '\(name)', using default")
-        }
-        return override ?? .default
+        // No logging here: this is reached from a SwiftUI body, and reading the key
+        // decodes the whole [String: AnimationTransformConfig] payload each time.
+        Defaults[.animationTransformOverrides][id.uuidString] ?? .default
     }
 }
 

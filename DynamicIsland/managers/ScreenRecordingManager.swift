@@ -58,7 +58,10 @@ class ScreenRecordingManager: ObservableObject {
     // MARK: - Published Properties
     @Published var isRecording: Bool = false
     @Published var isMonitoring: Bool = false
-    @Published var recordingDuration: TimeInterval = 0
+    // Deliberately not @Published: nothing outside this manager reads it, and the
+    // duration timer ticks throughout a recording — publishing it invalidated every
+    // ContentView (one per display) 10x a second for output nobody renders.
+    private(set) var recordingDuration: TimeInterval = 0
     @Published var isRecorderIdle: Bool = true
     @Published var lastUpdated: Date = .distantPast
     
@@ -201,11 +204,15 @@ class ScreenRecordingManager: ObservableObject {
         recordingStartTime = Date()
         recordingDuration = 0
         
-        durationTimer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in
+        // 1s, not 0.1s: the value has seconds resolution, so ten ticks per second
+        // bought nothing. Tolerance lets the OS coalesce the wakeups.
+        let timer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
             Task { @MainActor in
                 self?.updateDuration()
             }
         }
+        timer.tolerance = 0.2
+        durationTimer = timer
         
         print("ScreenRecordingManager: ⏱️ Started duration tracking")
     }
