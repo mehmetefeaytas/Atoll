@@ -2081,6 +2081,7 @@ private final class AirPodsListeningModeLogObserver {
     var onModeChange: ((AirPodsListeningMode, String?) -> Void)?
 
     private var process: Process?
+    private var outputPipe: Pipe?
     private let queue = DispatchQueue(label: "com.dynamicisland.airpods-listening-log", qos: .utility)
     private var lineBuffer = ""
 
@@ -2112,6 +2113,7 @@ private final class AirPodsListeningModeLogObserver {
         do {
             try process.run()
             self.process = process
+            self.outputPipe = outputPipe
             print("🎧 [BluetoothAudioManager] AirPods listening mode log observer started")
         } catch {
             outputPipe.fileHandleForReading.readabilityHandler = nil
@@ -2120,8 +2122,23 @@ private final class AirPodsListeningModeLogObserver {
     }
 
     func stop() {
+        // Clear the readability handler *before* terminating: once the child
+        // exits, the pipe's write end closes and the read source fires
+        // continuously at EOF, burning a read() plus an autoreleased NSData per
+        // iteration forever. Dropping the pipe also lets the read/write file
+        // descriptors go away (they are only released once the source is
+        // cancelled and the Pipe deallocates).
+        outputPipe?.fileHandleForReading.readabilityHandler = nil
+        outputPipe = nil
+
         process?.terminate()
         process = nil
+
+        // `lineBuffer` is only ever touched on `queue`, so it is reset there
+        // rather than from the caller's thread.
+        queue.async { [weak self] in
+            self?.lineBuffer = ""
+        }
     }
 
     private func consume(_ text: String) {

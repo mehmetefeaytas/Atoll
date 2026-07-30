@@ -48,6 +48,9 @@ class FilteredNowPlayingController: ObservableObject, MediaControllerProtocol {
 
     private var process: Process?
     private var pipeHandler: JSONLinesPipeHandler?
+    /// Retained only so the stderr readability handler can be torn down; an
+    /// orphaned handler spins on EOF once the subprocess exits.
+    private var stderrPipe: Pipe?
     private var streamTask: Task<Void, Never>?
     private let targetBundleIdentifier: String
     private let controllerName: String
@@ -97,6 +100,11 @@ class FilteredNowPlayingController: ObservableObject, MediaControllerProtocol {
         if let pipeHandler = self.pipeHandler {
             Task { await pipeHandler.close() }
         }
+
+        // Clear before the process dies: the write end of the stderr pipe closes
+        // with it and the read source would then fire continuously at EOF.
+        stderrPipe?.fileHandleForReading.readabilityHandler = nil
+        stderrPipe = nil
 
         if let process = self.process {
             if process.isRunning {
@@ -188,6 +196,7 @@ class FilteredNowPlayingController: ObservableObject, MediaControllerProtocol {
 
         self.process = process
         self.pipeHandler = pipeHandler
+        self.stderrPipe = stderrPipe
 
         do {
             try process.run()
@@ -195,6 +204,8 @@ class FilteredNowPlayingController: ObservableObject, MediaControllerProtocol {
                 await self?.processJSONStream()
             }
         } catch {
+            stderrPipe.fileHandleForReading.readabilityHandler = nil
+            self.stderrPipe = nil
             assertionFailure("Failed to launch mediaremote-adapter.pl: \(error)")
         }
     }

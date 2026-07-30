@@ -56,6 +56,9 @@ final class NowPlayingController: ObservableObject, MediaControllerProtocol {
 
     private var process: Process?
     private var pipeHandler: JSONLinesPipeHandler?
+    /// Retained only so the stderr readability handler can be torn down; an
+    /// orphaned handler spins on EOF once the subprocess exits.
+    private var stderrPipe: Pipe?
     private var streamTask: Task<Void, Never>?
 
     // MARK: - Lazy-start gating
@@ -152,6 +155,11 @@ final class NowPlayingController: ObservableObject, MediaControllerProtocol {
             Task { await pipeHandler.close()
             }
         }
+
+        // Same EOF-spin hazard as `stopStreaming()`; the handler outlives this
+        // object because the dispatch source, not us, owns it.
+        stderrPipe?.fileHandleForReading.readabilityHandler = nil
+        stderrPipe = nil
 
         if let process = self.process {
             if process.isRunning {
@@ -313,6 +321,7 @@ final class NowPlayingController: ObservableObject, MediaControllerProtocol {
 
         self.process = process
         self.pipeHandler = pipeHandler
+        self.stderrPipe = stderrPipe
 
         do {
             try process.run()
@@ -323,6 +332,8 @@ final class NowPlayingController: ObservableObject, MediaControllerProtocol {
             // Reset so a later demand can retry cleanly.
             self.process = nil
             self.pipeHandler = nil
+            stderrPipe.fileHandleForReading.readabilityHandler = nil
+            self.stderrPipe = nil
             assertionFailure("Failed to launch mediaremote-adapter.pl: \(error)")
         }
     }
@@ -337,6 +348,12 @@ final class NowPlayingController: ObservableObject, MediaControllerProtocol {
         if let pipeHandler = self.pipeHandler {
             Task { await pipeHandler.close() }
         }
+
+        // Must happen before the process dies: the write end of the stderr pipe
+        // closes with it and the read source would then fire continuously at
+        // EOF, spinning a read() per iteration for the lifetime of the app.
+        stderrPipe?.fileHandleForReading.readabilityHandler = nil
+        stderrPipe = nil
 
         if let process = self.process, process.isRunning {
             process.terminate()
@@ -443,7 +460,13 @@ actor JSONLinesPipeHandler {
     private let pipe: Pipe
     private let fileHandle: FileHandle
     private var buffer = ""
-    
+    /// The read currently suspended in `readData()`. Tracked so `close()` can
+    /// hand it an EOF instead of abandoning it — an unresumed
+    /// `CheckedContinuation` keeps its task (and this actor, its buffer and the
+    /// pipe) alive forever.
+    private var pendingRead: CheckedContinuation<Data, Error>?
+    private var isClosed = false
+
     init() {
         self.pipe = Pipe()
         self.fileHandle = pipe.fileHandleForReading
@@ -496,19 +519,38 @@ actor JSONLinesPipeHandler {
     }
     
     private func readData() async throws -> Data {
+        // After `close()` the descriptor is gone; an empty read is the same
+        // signal `processLines` already treats as end of stream.
+        guard !isClosed else { return Data() }
+
         return try await withCheckedThrowingContinuation { continuation in
-            
-            fileHandle.readabilityHandler = { handle in
+            pendingRead = continuation
+
+            fileHandle.readabilityHandler = { [weak self] handle in
                 let data = handle.availableData
                 handle.readabilityHandler = nil
-                continuation.resume(returning: data)
+                // Hop back onto the actor so this and `close()` cannot both
+                // resume the same continuation.
+                Task { await self?.finishPendingRead(with: data) }
             }
         }
     }
-    
+
+    private func finishPendingRead(with data: Data) {
+        guard let continuation = pendingRead else { return }
+        pendingRead = nil
+        continuation.resume(returning: data)
+    }
+
     func close() async {
+        isClosed = true
+
         do {
             fileHandle.readabilityHandler = nil
+            // Resume before closing the descriptor: a read suspended here would
+            // otherwise never come back, pinning its task and everything it
+            // captured.
+            finishPendingRead(with: Data())
             try fileHandle.close()
             try pipe.fileHandleForWriting.close()
         } catch {
