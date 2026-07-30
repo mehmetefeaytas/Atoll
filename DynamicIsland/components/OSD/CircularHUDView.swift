@@ -35,9 +35,15 @@ struct CircularHUDView: View {
     
     @Default(.useColorCodedVolumeDisplay) var useColorCodedVolume
     @Default(.useSmoothColorGradient) var useSmoothGradient
-    
+
+    @ObservedObject private var outputKindMonitor = AudioOutputKindMonitor.shared
+
     var body: some View {
-        ZStack {
+        // Resolve once per body evaluation: `symbolName` is used twice below (the
+        // image and its animation trigger) and each read walked the icon rules.
+        let symbol = symbolName
+
+        return ZStack {
             // Background circle (SOLO OPAQUE - No transparency)
             Circle()
                 .fill(Color(white: 0.1))
@@ -81,12 +87,12 @@ struct CircularHUDView: View {
             .frame(width: size, height: size)
             
             // Central Icon
-            Image(systemName: symbolName)
+            Image(systemName: symbol)
                 .font(.system(size: size * 0.32, weight: .bold))
                 .symbolRenderingMode(.hierarchical)
                 .foregroundStyle(.white)
                 .contentTransition(.symbolEffect(.replace))
-                .animation(.spring(response: 0.3, dampingFraction: 0.6), value: symbolName)
+                .animation(.spring(response: 0.3, dampingFraction: 0.6), value: symbol)
             
             // Bottom Value Label
             if showValue {
@@ -124,21 +130,19 @@ struct CircularHUDView: View {
     
     private var symbolName: String {
         if !icon.isEmpty { return icon }
-        
+
         switch type {
         case .volume:
-            // Check if headphones/AirPods are connected
-            let deviceInfo = getAudioDeviceInfo()
-            
-            if deviceInfo.isAirPods {
+            switch outputKindMonitor.kind {
+            case .airPods:
                 // Use AirPods icon when AirPods are connected
                 if value < 0.01 { return "headphones.slash" }
                 else { return "airpods" }
-            } else if deviceInfo.isHeadphones {
+            case .headphones:
                 // Use headphone icons when other headphones are connected
                 if value < 0.01 { return "headphones.slash" }
                 else { return "headphones" }
-            } else {
+            case .speakers:
                 // Use speaker icons for built-in speakers
                 if value < 0.01 { return "speaker.slash.fill" }
                 else if value < 0.33 { return "speaker.wave.1.fill" }
@@ -153,15 +157,82 @@ struct CircularHUDView: View {
             return "questionmark"
         }
     }
-    
-    private struct AudioDeviceInfo {
-        let isAirPods: Bool
-        let isHeadphones: Bool
+}
+
+/// Mutable state for a long-lived circular HUD window.
+///
+/// The window manager hosts `CircularHUDView` through `CircularHUDHost` and mutates
+/// this object rather than reassigning `hostingView.rootView`, which lets the hosting
+/// view's render graph — and its in-flight spring animations — survive across
+/// updates instead of restarting from scratch on every keypress.
+final class CircularHUDState: ObservableObject {
+    @Published var type: SneakContentType
+    @Published var value: CGFloat
+    @Published var icon: String
+
+    init(type: SneakContentType, value: CGFloat = 0, icon: String = "") {
+        self.type = type
+        self.value = value
+        self.icon = icon
     }
-    
-    private func getAudioDeviceInfo() -> AudioDeviceInfo {
-        #if os(macOS)
-        // Get default output device
+}
+
+struct CircularHUDHost: View {
+    @ObservedObject var state: CircularHUDState
+
+    var body: some View {
+        CircularHUDView(
+            type: .constant(state.type),
+            value: .constant(state.value),
+            icon: .constant(state.icon)
+        )
+    }
+}
+
+enum AudioOutputKind {
+    case airPods
+    case headphones
+    case speakers
+}
+
+/// Caches which kind of device audio is currently coming out of.
+///
+/// `CircularHUDView` used to resolve this inside a computed property read from
+/// `body`, so every render did two synchronous CoreAudio round-trips — four, since
+/// the property was read twice per body evaluation. The answer can only change on
+/// an output-route change, which CoreAudio already tells us about via
+/// `.systemAudioRouteDidChange`, so one cached value serves every render.
+@MainActor
+final class AudioOutputKindMonitor: ObservableObject {
+    static let shared = AudioOutputKindMonitor()
+
+    @Published private(set) var kind: AudioOutputKind = .speakers
+
+    private init() {
+        refresh()
+        NotificationCenter.default.addObserver(
+            forName: .systemAudioRouteDidChange,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { self?.refresh() }
+        }
+    }
+
+    private func refresh() {
+        // The two CoreAudio queries are IPC to coreaudiod; keep them off main.
+        DispatchQueue.global(qos: .userInitiated).async {
+            let resolved = Self.resolveOutputKind()
+            DispatchQueue.main.async { [weak self] in
+                MainActor.assumeIsolated {
+                    guard let self, self.kind != resolved else { return }
+                    self.kind = resolved
+                }
+            }
+        }
+    }
+
+    private static func resolveOutputKind() -> AudioOutputKind {
         var deviceID = AudioDeviceID()
         var size = UInt32(MemoryLayout.size(ofValue: deviceID))
         var address = AudioObjectPropertyAddress(
@@ -169,12 +240,11 @@ struct CircularHUDView: View {
             mScope: kAudioObjectPropertyScopeGlobal,
             mElement: kAudioObjectPropertyElementMain
         )
-        
+
         guard AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &address, 0, nil, &size, &deviceID) == noErr else {
-            return AudioDeviceInfo(isAirPods: false, isHeadphones: false)
+            return .speakers
         }
-        
-        // Get device name
+
         var deviceName: CFString = "" as CFString
         var nameSize = UInt32(MemoryLayout<CFString>.size)
         var nameAddress = AudioObjectPropertyAddress(
@@ -182,26 +252,22 @@ struct CircularHUDView: View {
             mScope: kAudioObjectPropertyScopeGlobal,
             mElement: kAudioObjectPropertyElementMain
         )
-        
+
         guard AudioObjectGetPropertyData(deviceID, &nameAddress, 0, nil, &nameSize, &deviceName) == noErr else {
-            return AudioDeviceInfo(isAirPods: false, isHeadphones: false)
+            return .speakers
         }
-        
+
+        // Matching rules preserved verbatim from the previous inline implementation
+        // so icon selection does not change.
         let name = (deviceName as String).lowercased()
-        
-        // Check for AirPods specifically
-        let isAirPods = name.contains("airpod")
-        
-        // Check for other headphones
-        let isHeadphones = name.contains("headphone") || 
-                          name.contains("ear") ||
-                          name.contains("buds") ||
-                          name.contains("beats")
-        
-        return AudioDeviceInfo(isAirPods: isAirPods, isHeadphones: !isAirPods && isHeadphones)
-        #else
-        return AudioDeviceInfo(isAirPods: false, isHeadphones: false)
-        #endif
+        if name.contains("airpod") { return .airPods }
+        if name.contains("headphone")
+            || name.contains("ear")
+            || name.contains("buds")
+            || name.contains("beats") {
+            return .headphones
+        }
+        return .speakers
     }
 }
 #endif

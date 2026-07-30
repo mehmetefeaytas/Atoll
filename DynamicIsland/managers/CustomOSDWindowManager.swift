@@ -123,8 +123,8 @@ final class CustomOSDWindowManager {
     }
     
     private func createWindow(for type: SneakContentType, screen: NSScreen) -> OSDWindow {
-        let osdView = CustomOSDView(type: .constant(type), value: .constant(0), icon: .constant(""))
-        let hostingView = NSHostingView(rootView: osdView)
+        let state = CustomOSDState(type: type)
+        let hostingView = NSHostingView(rootView: CustomOSDHost(state: state))
         
         let frame = calculateFrame(for: screen)
         let window = NSWindow(
@@ -145,12 +145,20 @@ final class CustomOSDWindowManager {
         // Delegate to SkyLight for proper rendering
         SkyLightOperator.shared.delegateWindow(window)
         
-        return OSDWindow(nsWindow: window, hostingView: hostingView, type: type)
+        return OSDWindow(nsWindow: window, hostingView: hostingView, state: state, type: type)
     }
-    
+
+    /// Mutates the hosted state instead of reassigning `hostingView.rootView`,
+    /// which used to rebuild the entire SwiftUI graph on every HUD update.
     private func updateContent(window: OSDWindow, type: SneakContentType, value: CGFloat, icon: String) {
-        let osdView = CustomOSDView(type: .constant(type), value: .constant(value), icon: .constant(icon))
-        window.hostingView.rootView = osdView
+        guard window.state.type != type
+                || window.state.value != value
+                || window.state.icon != icon else {
+            return
+        }
+        window.state.type = type
+        window.state.value = value
+        window.state.icon = icon
     }
     
     private func calculateFrame(for screen: NSScreen) -> NSRect {
@@ -275,8 +283,36 @@ final class CustomOSDWindowManager {
 
 private struct OSDWindow {
     let nsWindow: NSWindow
-    let hostingView: NSHostingView<CustomOSDView>
+    let hostingView: NSHostingView<CustomOSDHost>
+    let state: CustomOSDState
     let type: SneakContentType
+}
+
+/// Mutable state for a long-lived custom OSD window. `CustomOSDView` keeps its
+/// `.constant(...)` binding API so the settings live preview can keep building it
+/// directly (see `SettingsView`); only the window manager goes through this host.
+final class CustomOSDState: ObservableObject {
+    @Published var type: SneakContentType
+    @Published var value: CGFloat
+    @Published var icon: String
+
+    init(type: SneakContentType, value: CGFloat = 0, icon: String = "") {
+        self.type = type
+        self.value = value
+        self.icon = icon
+    }
+}
+
+struct CustomOSDHost: View {
+    @ObservedObject var state: CustomOSDState
+
+    var body: some View {
+        CustomOSDView(
+            type: .constant(state.type),
+            value: .constant(state.value),
+            icon: .constant(state.icon)
+        )
+    }
 }
 
 #endif

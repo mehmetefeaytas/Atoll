@@ -94,8 +94,8 @@ final class CircularHUDWindowManager {
             return existing
         }
         
-        let osdView = CircularHUDView(type: .constant(type), value: .constant(0), icon: .constant(""))
-        let hostingView = NSHostingView(rootView: osdView)
+        let state = CircularHUDState(type: type)
+        let hostingView = NSHostingView(rootView: CircularHUDHost(state: state))
         
         let screenFrame = screen.frame
         
@@ -124,14 +124,28 @@ final class CircularHUDWindowManager {
         
         SkyLightOperator.shared.delegateWindow(win)
         
-        let windowStruct = OSDWindow(nsWindow: win, hostingView: hostingView, type: type)
+        let windowStruct = OSDWindow(nsWindow: win, hostingView: hostingView, state: state, type: type)
         windows[screen] = windowStruct
         return windowStruct
     }
-    
+
+    /// Mutates the hosted state instead of reassigning `hostingView.rootView`.
+    ///
+    /// Replacing the root view rebuilt the whole SwiftUI graph on every update, so
+    /// the `.interactiveSpring` arc animations restarted from scratch each time and
+    /// visibly snapped between consecutive key presses instead of interpolating.
+    /// `VerticalHUDWindowManager` has always done it this way.
     private func updateContent(window: OSDWindow, type: SneakContentType, value: CGFloat, icon: String) {
-        let osdView = CircularHUDView(type: .constant(type), value: .constant(value), icon: .constant(icon))
-        window.hostingView.rootView = osdView
+        guard window.state.type != type
+                || window.state.value != value
+                || window.state.icon != icon else {
+            // Identical triple: nothing to redraw. Cheap backstop for duplicate
+            // emissions, and it matters because show() loops over every screen.
+            return
+        }
+        window.state.type = type
+        window.state.value = value
+        window.state.icon = icon
     }
     
     private func scheduleHide() {
@@ -162,7 +176,8 @@ final class CircularHUDWindowManager {
     // Helper struct
     private struct OSDWindow {
         let nsWindow: NSWindow
-        let hostingView: NSHostingView<CircularHUDView>
+        let hostingView: NSHostingView<CircularHUDHost>
+        let state: CircularHUDState
         let type: SneakContentType
     }
 }

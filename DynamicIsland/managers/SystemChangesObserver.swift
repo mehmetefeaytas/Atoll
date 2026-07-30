@@ -71,13 +71,10 @@ final class SystemChangesObserver: MediaKeyInterceptorDelegate {
                 self.sendVolumeNotification(value: value, isMuted: muted)
             }
         }
-        volumeController.onRouteChange = { [weak self] in
-            guard let self, self.volumeEnabled else { return }
-            let muted = self.volumeController.isMuted
-            Task { @MainActor in
-                self.sendVolumeNotification(value: muted ? 0 : self.volumeController.currentVolume, isMuted: muted)
-            }
-        }
+        // Deliberately no volume re-send here: handleDefaultDeviceChanged() already
+        // emits a forced notifyCurrentState() for the same route change, which
+        // arrives through onVolumeChange above. Re-sending meant two extra
+        // synchronous HAL round-trips on the main thread plus a duplicate HUD show.
         volumeController.start()
 
         brightnessController.onBrightnessChange = { [weak self] brightness in
@@ -159,7 +156,11 @@ final class SystemChangesObserver: MediaKeyInterceptorDelegate {
         
         // Elastic Limit Detection (Vertical HUD)
         if Defaults[.enableVerticalHUD] {
-            let volume = volumeController.currentVolume
+            // Use the last published value rather than `currentVolume`: this runs on
+            // the media-key path, where a synchronous HAL read costs several IPC
+            // round-trips to coreaudiod. Falls back to a live read only before the
+            // first emission has landed.
+            let volume = volumeController.lastKnownVolume ?? volumeController.currentVolume
             if direction == .up && volume >= 0.99 {
                 Task { @MainActor in VerticalHUDWindowManager.shared.triggerBump(direction: 1) }
             } else if direction == .down && volume <= 0.01 {
@@ -222,9 +223,10 @@ final class SystemChangesObserver: MediaKeyInterceptorDelegate {
 
     @MainActor
     private func sendVolumeNotification(value: Float, isMuted: Bool) {
-        // The CoreAudio volume write wakes the native OSD; suppress it immediately
-        // so only our notch HUD shows (parity with brightness). No-op unless active.
-        SystemOSDManager.suppressNativeOSDNow()
+        // No suppressNativeOSDNow() here on purpose. This runs once per *emission*
+        // (2-3x per keypress) and always *after* the CoreAudio write, so it can
+        // only ever lose a race that the pre-write call in the media-key handlers
+        // above has already decided. Those call sites are the ones that matter.
 
         if HUDSuppressionCoordinator.shared.shouldSuppressVolumeHUD {
             return

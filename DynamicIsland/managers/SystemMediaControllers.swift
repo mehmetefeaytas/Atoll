@@ -20,6 +20,7 @@ import Foundation
 import CoreAudio
 import CoreGraphics
 import IOKit
+import os
 
 extension Notification.Name {
     static let systemVolumeDidChange = Notification.Name("DynamicIsland.systemVolumeDidChange")
@@ -79,6 +80,62 @@ final class SystemVolumeController {
         let block: AudioObjectPropertyListenerBlock
     }
 
+    // MARK: - Emission throttling
+
+    private struct EmissionState {
+        var lastVolume: Float = -1
+        var lastMuted: Bool?
+        var lastEmission: Date = .distantPast
+        var pending: (Float, Bool)?
+    }
+    /// Locked because emissions arrive from both the main thread (`setVolume`) and
+    /// `callbackQueue` (the HAL property listener).
+    private let emissionState = OSAllocatedUnfairLock(initialState: EmissionState())
+    /// 25 fps, mirroring `SystemBrightnessController.minimumEmissionInterval`.
+    private let minimumVolumeEmissionInterval: TimeInterval = 0.04
+    private let volumeEqualityEpsilon: Float = 0.0005
+
+    /// Most recent known value, for callers on the media-key path that would
+    /// otherwise hit the HAL synchronously just to read the current volume.
+    ///
+    /// Prefers a throttled-but-not-yet-published value over the last published one,
+    /// so a caller during key repeat is not up to one throttle window behind.
+    var lastKnownVolume: Float? {
+        emissionState.withLock { state in
+            if let pending = state.pending { return pending.0 }
+            return state.lastVolume < 0 ? nil : state.lastVolume
+        }
+    }
+
+    var lastKnownMuted: Bool? {
+        emissionState.withLock { state in
+            state.pending?.1 ?? state.lastMuted
+        }
+    }
+
+    // MARK: - Property-element cache
+
+    /// The set of CoreAudio elements that actually carry volume/mute for a given
+    /// device. Probing costs one `AudioObjectHasProperty` IPC round-trip per
+    /// candidate element, and `getVolume()`/`getMuteState()` used to re-probe on
+    /// every single read — several times per keypress, on the main thread.
+    ///
+    /// Caching is safe here specifically because the snapshot is an immutable
+    /// value keyed by the device it was probed for: a stale snapshot is detected
+    /// by the `deviceID` mismatch rather than silently used, so a read racing
+    /// `refreshPropertyElements()` on `callbackQueue` simply re-probes.
+    ///
+    /// Callers must read `currentDeviceID` **once** per operation and thread that
+    /// same value through both the snapshot lookup and the subsequent HAL access —
+    /// re-reading the property would let elements probed for device A be applied to
+    /// device B when a route change lands mid-operation.
+    private struct ElementSnapshot {
+        let deviceID: AudioDeviceID
+        let volume: [AudioObjectPropertyElement]
+        let mute: [AudioObjectPropertyElement]
+    }
+    private let elementSnapshot = OSAllocatedUnfairLock<ElementSnapshot?>(initialState: nil)
+
     private let candidateElements: [AudioObjectPropertyElement] = [
         kAudioObjectPropertyElementMain,
         AudioObjectPropertyElement(1),
@@ -90,7 +147,7 @@ final class SystemVolumeController {
         refreshPropertyElements()
         installDefaultDeviceListener()
         installVolumeListeners(for: currentDeviceID)
-        notifyCurrentState()
+        notifyCurrentState(force: true)
     }
 
     func start() {
@@ -137,18 +194,18 @@ final class SystemVolumeController {
             setMuted(false)
         }
 
-        let elements = volumeElements()
+        let target = volumeTarget()
 
-        if elements.isEmpty {
+        if target.elements.isEmpty {
             var volume = clamped
             let status = setData(selector: kAudioDevicePropertyVolumeScalar, data: &volume)
             if status != noErr {
                 NSLog("⚠️ Failed to set volume: \(status)")
             }
         } else {
-            for element in elements {
+            for element in target.elements {
                 var volume = clamped
-                let status = setData(selector: kAudioDevicePropertyVolumeScalar, element: element, data: &volume)
+                let status = setData(selector: kAudioDevicePropertyVolumeScalar, element: element, deviceID: target.deviceID, data: &volume)
                 if status != noErr {
                     NSLog("⚠️ Failed to set volume for element \(element): \(status)")
                 } else {
@@ -156,14 +213,17 @@ final class SystemVolumeController {
                 }
             }
         }
-        notifyCurrentState()
+        // userInitiated: this is our own write, driven by a key press or a slider
+        // drag. It must reach the HUD even when the value did not actually change
+        // (volume-up at 100%, volume-down at 0%).
+        notifyCurrentState(userInitiated: true)
     }
 
     func setMuted(_ muted: Bool) {
         var muteFlag: UInt32 = muted ? 1 : 0
-        let elements = muteElements()
+        let target = muteTarget()
 
-        if elements.isEmpty {
+        if target.elements.isEmpty {
             let status = setData(selector: kAudioDevicePropertyMute, data: &muteFlag)
             if status != noErr {
                 NSLog("⚠️ Failed to set mute state: \(status)")
@@ -171,9 +231,9 @@ final class SystemVolumeController {
             return
         }
 
-        for element in elements {
+        for element in target.elements {
             var value = muteFlag
-            let status = setData(selector: kAudioDevicePropertyMute, element: element, data: &value)
+            let status = setData(selector: kAudioDevicePropertyMute, element: element, deviceID: target.deviceID, data: &value)
             if status != noErr {
                 NSLog("⚠️ Failed to set mute state for element \(element): \(status)")
             } else {
@@ -271,7 +331,9 @@ final class SystemVolumeController {
             self.currentDeviceID = self.resolveDefaultDevice()
             self.refreshPropertyElements()
             self.installVolumeListeners(for: self.currentDeviceID)
-            self.notifyCurrentState()
+            // Forced: a new output device must repaint the HUD even when the
+            // volume it reports is identical to the previous device's.
+            self.notifyCurrentState(force: true)
             DispatchQueue.main.async {
                 self.onRouteChange?()
                 NotificationCenter.default.post(name: .systemAudioRouteDidChange, object: nil)
@@ -279,9 +341,90 @@ final class SystemVolumeController {
         }
     }
 
-    private func notifyCurrentState() {
+    /// Publishes the current volume/mute state to the HUD, deduplicated and rate
+    /// limited.
+    ///
+    /// Every `setVolume` used to emit twice: once directly, and once more when the
+    /// CoreAudio property listener fired for the write we had just made. A muted
+    /// device made it three times. Each emission runs the whole HUD pipeline
+    /// (window updates per screen, `ContentView` invalidation, HAL reads), so one
+    /// keypress did 2-3x the necessary work.
+    ///
+    /// The equality gate below is a last-*value* comparison, not an "is this echo
+    /// ours?" tracker: an expected-value tracker can swallow a genuine external
+    /// change that races our own write, whereas comparing values cannot. External
+    /// changes (menu bar slider, Control Center, other apps) arrive through the
+    /// same listener carrying a *different* value, so they always pass.
+    ///
+    /// - Parameter force: emit even if the value is unchanged, bypassing the
+    ///   throttle too. Used for init and route changes, where the HUD must repaint
+    ///   for a new device even when the volume happens to be identical.
+    /// - Parameter userInitiated: skip the equality gate but keep the throttle.
+    ///   Required for our own writes: pressing volume-up at 100% (or volume-down
+    ///   while already muted) produces no value change, and without this the HUD
+    ///   would simply not appear at either limit — which is exactly where the user
+    ///   most expects the feedback. Only the HAL echoes get deduplicated.
+    private func notifyCurrentState(force: Bool = false, userInitiated: Bool = false) {
         let volume = getVolume()
         let muted = getMuteState()
+
+        enum Action { case emit, coalesce, drop }
+        let action = emissionState.withLock { state -> Action in
+            if !force, !userInitiated,
+               state.lastMuted == muted,
+               abs(state.lastVolume - volume) < volumeEqualityEpsilon {
+                // Drop the stale trailing value too: without this an A→B→A sequence
+                // inside one throttle window leaves `pending == B` and publishes B
+                // after the real value is already back to A (double-tapping mute
+                // would leave the HUD stuck showing "muted").
+                state.pending = nil
+                return .drop
+            }
+
+            let now = Date()
+            guard force || now.timeIntervalSince(state.lastEmission) >= minimumVolumeEmissionInterval else {
+                // Trailing edge, not a plain drop. Brightness can afford to drop
+                // ticks because its animation timer force-emits the final value;
+                // volume has no such final emit, so dropping under key-repeat
+                // would leave the HUD one step behind the real volume.
+                let alreadyScheduled = state.pending != nil
+                state.pending = (volume, muted)
+                return alreadyScheduled ? .drop : .coalesce
+            }
+
+            state.lastVolume = volume
+            state.lastMuted = muted
+            state.lastEmission = now
+            state.pending = nil
+            return .emit
+        }
+
+        switch action {
+        case .drop:
+            return
+        case .coalesce:
+            callbackQueue.asyncAfter(deadline: .now() + minimumVolumeEmissionInterval) { [weak self] in
+                self?.flushPendingEmission()
+            }
+        case .emit:
+            publish(volume: volume, muted: muted)
+        }
+    }
+
+    private func flushPendingEmission() {
+        let pending = emissionState.withLock { state -> (Float, Bool)? in
+            guard let pending = state.pending else { return nil }
+            state.pending = nil
+            state.lastVolume = pending.0
+            state.lastMuted = pending.1
+            state.lastEmission = Date()
+            return pending
+        }
+        guard let pending else { return }
+        publish(volume: pending.0, muted: pending.1)
+    }
+
+    private func publish(volume: Float, muted: Bool) {
         DispatchQueue.main.async {
             self.onVolumeChange?(volume, muted)
             NotificationCenter.default.post(name: .systemVolumeDidChange, object: nil, userInfo: ["value": volume, "muted": muted])
@@ -289,9 +432,9 @@ final class SystemVolumeController {
     }
 
     private func getVolume() -> Float {
-        let elements = volumeElements()
+        let target = volumeTarget()
 
-        if elements.isEmpty {
+        if target.elements.isEmpty {
             var volume = Float32(0)
             let status = getData(selector: kAudioDevicePropertyVolumeScalar, data: &volume)
             if status != noErr {
@@ -304,9 +447,9 @@ final class SystemVolumeController {
         var accumulator: Float = 0
         var count: Float = 0
 
-        for element in elements {
+        for element in target.elements {
             var value = Float32(0)
-            let status = getData(selector: kAudioDevicePropertyVolumeScalar, element: element, data: &value)
+            let status = getData(selector: kAudioDevicePropertyVolumeScalar, element: element, deviceID: target.deviceID, data: &value)
             if status == noErr {
                 if element == kAudioObjectPropertyElementMaster {
                     masterVolume = value
@@ -333,9 +476,9 @@ final class SystemVolumeController {
     }
 
     private func getMuteState() -> Bool {
-        let elements = muteElements()
+        let target = muteTarget()
 
-        if elements.isEmpty {
+        if target.elements.isEmpty {
             var mute: UInt32 = 0
             let status = getData(selector: kAudioDevicePropertyMute, data: &mute)
             if status != noErr {
@@ -347,9 +490,9 @@ final class SystemVolumeController {
         var retrieved = false
         var allMuted = true
 
-        for element in elements {
+        for element in target.elements {
             var value: UInt32 = 0
-            let status = getData(selector: kAudioDevicePropertyMute, element: element, data: &value)
+            let status = getData(selector: kAudioDevicePropertyMute, element: element, deviceID: target.deviceID, data: &value)
             if status == noErr {
                 retrieved = true
                 if value == 0 {
@@ -371,8 +514,12 @@ final class SystemVolumeController {
     }
 
     private func refreshPropertyElements() {
+        invalidateElementSnapshot()
         volumeElement = resolveElement(selector: kAudioDevicePropertyVolumeScalar, deviceID: currentDeviceID)
         muteElement = resolveElement(selector: kAudioDevicePropertyMute, deviceID: currentDeviceID)
+        // Populate eagerly so the probe happens here, on callbackQueue, instead of
+        // on the media-key path.
+        _ = snapshot(for: currentDeviceID)
     }
 
     private func resolveElement(selector: AudioObjectPropertySelector, deviceID: AudioDeviceID) -> AudioObjectPropertyElement? {
@@ -458,39 +605,75 @@ final class SystemVolumeController {
         return lastStatus
     }
 
-    private func getData<T>(selector: AudioObjectPropertySelector, element: AudioObjectPropertyElement, data: inout T) -> OSStatus {
+    // No propertyExists() pre-check in these two: callers pass elements that came
+    // from the (already probed) snapshot, so the guard was a second HAL round-trip
+    // per element per read. Let AudioObject* report its own status — every caller
+    // already branches on `status == noErr`.
+    //
+    // `deviceID` is passed in rather than read from `currentDeviceID` so it is the
+    // same device the elements were probed against; see ElementSnapshot.
+    private func getData<T>(
+        selector: AudioObjectPropertySelector,
+        element: AudioObjectPropertyElement,
+        deviceID: AudioDeviceID,
+        data: inout T
+    ) -> OSStatus {
         var address = makeAddress(selector: selector, element: element)
-        guard propertyExists(deviceID: currentDeviceID, address: &address) else {
-            return kAudioHardwareUnknownPropertyError
-        }
         var size = UInt32(MemoryLayout<T>.size)
-        return AudioObjectGetPropertyData(currentDeviceID, &address, 0, nil, &size, &data)
+        return AudioObjectGetPropertyData(deviceID, &address, 0, nil, &size, &data)
     }
 
-    private func setData<T>(selector: AudioObjectPropertySelector, element: AudioObjectPropertyElement, data: inout T) -> OSStatus {
+    private func setData<T>(
+        selector: AudioObjectPropertySelector,
+        element: AudioObjectPropertyElement,
+        deviceID: AudioDeviceID,
+        data: inout T
+    ) -> OSStatus {
         var address = makeAddress(selector: selector, element: element)
-        guard propertyExists(deviceID: currentDeviceID, address: &address) else {
-            return kAudioHardwareUnknownPropertyError
-        }
         let size = UInt32(MemoryLayout<T>.size)
-        return AudioObjectSetPropertyData(currentDeviceID, &address, 0, nil, size, &data)
+        return AudioObjectSetPropertyData(deviceID, &address, 0, nil, size, &data)
     }
 
-    // Computed on each access rather than cached: these are called synchronously
-    // from the public API on arbitrary threads while `refreshPropertyElements()`
-    // runs on `callbackQueue`, so a shared cache would race. The probe is cheap.
-    private func volumeElements() -> [AudioObjectPropertyElement] {
+    /// One read of `currentDeviceID` paired with the elements probed for exactly
+    /// that device, so a route change landing mid-operation cannot make us apply
+    /// device A's elements to device B.
+    private func volumeTarget() -> (deviceID: AudioDeviceID, elements: [AudioObjectPropertyElement]) {
+        let device = currentDeviceID
+        return (device, snapshot(for: device).volume)
+    }
+
+    private func muteTarget() -> (deviceID: AudioDeviceID, elements: [AudioObjectPropertyElement]) {
+        let device = currentDeviceID
+        return (device, snapshot(for: device).mute)
+    }
+
+    /// Returns the cached element sets for `deviceID`, probing the HAL only when
+    /// the cache is empty or belongs to a different device.
+    private func snapshot(for deviceID: AudioDeviceID) -> ElementSnapshot {
+        if let cached = elementSnapshot.withLock({ $0 }), cached.deviceID == deviceID {
+            return cached
+        }
+        let probed = ElementSnapshot(
+            deviceID: deviceID,
+            volume: probeElements(selector: kAudioDevicePropertyVolumeScalar, deviceID: deviceID),
+            mute: probeElements(selector: kAudioDevicePropertyMute, deviceID: deviceID)
+        )
+        elementSnapshot.withLock { $0 = probed }
+        return probed
+    }
+
+    private func probeElements(
+        selector: AudioObjectPropertySelector,
+        deviceID: AudioDeviceID
+    ) -> [AudioObjectPropertyElement] {
         candidateElements.filter { element in
-            var address = makeAddress(selector: kAudioDevicePropertyVolumeScalar, element: element)
-            return propertyExists(deviceID: currentDeviceID, address: &address)
+            var address = makeAddress(selector: selector, element: element)
+            return propertyExists(deviceID: deviceID, address: &address)
         }
     }
 
-    private func muteElements() -> [AudioObjectPropertyElement] {
-        candidateElements.filter { element in
-            var address = makeAddress(selector: kAudioDevicePropertyMute, element: element)
-            return propertyExists(deviceID: currentDeviceID, address: &address)
-        }
+    private func invalidateElementSnapshot() {
+        elementSnapshot.withLock { $0 = nil }
     }
 }
 
