@@ -34,13 +34,59 @@ final class CircularHUDWindowManager {
     private let animationDuration: TimeInterval = 0.2
     
     private var cancellables = Set<AnyCancellable>()
-    
+    private var screenChangeObserver: NSObjectProtocol?
+
     // Layout constants removed in favor of dynamic calculation
-    
+
     private init() {
         setupSizeObserver()
+        registerScreenChangeObservers()
     }
-    
+
+    deinit {
+        if let screenChangeObserver {
+            NotificationCenter.default.removeObserver(screenChangeObserver)
+        }
+    }
+
+    /// Registered exactly once, from the singleton's private `init`.
+    private func registerScreenChangeObservers() {
+        screenChangeObserver = NotificationCenter.default.addObserver(
+            forName: NSApplication.didChangeScreenParametersNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.pruneDetachedScreens()
+            }
+        }
+    }
+
+    /// Drops the windows of screens that no longer exist.
+    ///
+    /// `NSScreen` hashes by object identity and AppKit vends brand-new instances on
+    /// every display reconfiguration — sleep/wake, attaching or detaching an external
+    /// display, a resolution change. Keying `windows` by `NSScreen` therefore strands
+    /// the previous instance forever, and each stranded entry permanently retains an
+    /// `NSWindow` plus its `NSHostingView` and the whole SwiftUI graph behind it.
+    /// A screen that comes back simply gets a fresh window from `ensureWindow`.
+    private func pruneDetachedScreens() {
+        let activeScreens = Set(NSScreen.screens)
+        let staleScreens = windows.keys.filter { !activeScreens.contains($0) }
+        guard !staleScreens.isEmpty else { return }
+
+        for screen in staleScreens {
+            guard let window = windows.removeValue(forKey: screen) else { continue }
+            dispose(window)
+        }
+    }
+
+    private func dispose(_ window: OSDWindow) {
+        window.nsWindow.orderOut(nil)
+        // Release the hosting view with the window; nothing else references it.
+        window.nsWindow.contentView = nil
+    }
+
     private func setupSizeObserver() {
         Defaults.publisher(.circularHUDSize, options: []).sink { [weak self] _ in
             guard let self = self else { return }

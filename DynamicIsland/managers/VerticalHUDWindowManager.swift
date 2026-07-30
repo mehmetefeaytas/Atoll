@@ -35,11 +35,19 @@ final class VerticalHUDWindowManager {
     private let animationDuration: TimeInterval = 0.2
     
     private var cancellables = Set<AnyCancellable>()
-    
+    private var screenChangeObserver: NSObjectProtocol?
+
     private init() {
         setupPositionObserver()
+        registerScreenChangeObservers()
     }
-    
+
+    deinit {
+        if let screenChangeObserver {
+            NotificationCenter.default.removeObserver(screenChangeObserver)
+        }
+    }
+
     // Helper Struct
     private struct OSDWindow {
         let nsWindow: NSWindow
@@ -129,13 +137,52 @@ final class VerticalHUDWindowManager {
         hideWorkItem = nil
 
         for window in windows.values {
-            window.nsWindow.orderOut(nil)
-            window.nsWindow.ignoresMouseEvents = true
+            dispose(window)
         }
 
         windows.removeAll()
     }
-    
+
+    /// Registered exactly once, from the singleton's private `init`.
+    private func registerScreenChangeObservers() {
+        screenChangeObserver = NotificationCenter.default.addObserver(
+            forName: NSApplication.didChangeScreenParametersNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.pruneDetachedScreens()
+            }
+        }
+    }
+
+    /// Drops the windows of screens that no longer exist.
+    ///
+    /// `NSScreen` hashes by object identity and AppKit vends brand-new instances on
+    /// every display reconfiguration — sleep/wake, attaching or detaching an external
+    /// display, a resolution change. Keying `windows` by `NSScreen` therefore strands
+    /// the previous instance forever, and each stranded entry permanently retains an
+    /// `NSWindow` plus its `NSHostingView` and the whole SwiftUI graph behind it.
+    /// `teardownWindows()` only runs on feature disable, so it is not a substitute.
+    /// A screen that comes back simply gets a fresh window from `ensureWindow`.
+    private func pruneDetachedScreens() {
+        let activeScreens = Set(NSScreen.screens)
+        let staleScreens = windows.keys.filter { !activeScreens.contains($0) }
+        guard !staleScreens.isEmpty else { return }
+
+        for screen in staleScreens {
+            guard let window = windows.removeValue(forKey: screen) else { continue }
+            dispose(window)
+        }
+    }
+
+    private func dispose(_ window: OSDWindow) {
+        window.nsWindow.orderOut(nil)
+        window.nsWindow.ignoresMouseEvents = true
+        // Release the hosting view with the window; nothing else references it.
+        window.nsWindow.contentView = nil
+    }
+
     func show(type: SneakContentType, value: CGFloat, icon: String = "", onScreen targetScreen: NSScreen? = nil) {
         guard Defaults[.enableVerticalHUD] else { return }
         

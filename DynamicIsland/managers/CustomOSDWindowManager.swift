@@ -37,13 +37,22 @@ final class CustomOSDWindowManager {
     private let displayDuration: TimeInterval = 2.0
     private let animationDuration: TimeInterval = 0.3
     private var isInitialized = false
-    
+    private var screenChangeObserver: NSObjectProtocol?
+
     // Standard macOS OSD dimensions (approximate)
     private let osdWidth: CGFloat = 200
     private let osdHeight: CGFloat = 200
-    
-    private init() {}
-    
+
+    private init() {
+        registerScreenChangeObservers()
+    }
+
+    deinit {
+        if let screenChangeObserver {
+            NotificationCenter.default.removeObserver(screenChangeObserver)
+        }
+    }
+
     // MARK: - Public API
     
     func showVolume(value: CGFloat, isMuted: Bool = false, icon: String = "", onScreen targetScreen: NSScreen? = nil) {
@@ -262,20 +271,64 @@ final class CustomOSDWindowManager {
     func tearDown() {
         hideWorkItem?.cancel()
         hideWorkItem = nil
-        
+
         for window in volumeWindows.values {
-            window.nsWindow.orderOut(nil)
+            dispose(window)
         }
         for window in brightnessWindows.values {
-            window.nsWindow.orderOut(nil)
+            dispose(window)
         }
         for window in backlightWindows.values {
-            window.nsWindow.orderOut(nil)
+            dispose(window)
         }
-        
+
         volumeWindows.removeAll()
         brightnessWindows.removeAll()
         backlightWindows.removeAll()
+    }
+
+    /// Registered exactly once, from the singleton's private `init`.
+    private func registerScreenChangeObservers() {
+        screenChangeObserver = NotificationCenter.default.addObserver(
+            forName: NSApplication.didChangeScreenParametersNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.pruneDetachedScreens()
+            }
+        }
+    }
+
+    /// Drops the windows of screens that no longer exist.
+    ///
+    /// `NSScreen` hashes by object identity and AppKit vends brand-new instances on
+    /// every display reconfiguration — sleep/wake, attaching or detaching an external
+    /// display, a resolution change. Keying these dictionaries by `NSScreen` therefore
+    /// strands the previous instance forever, and each stranded entry permanently
+    /// retains an `NSWindow` plus its `NSHostingView` and the whole SwiftUI graph
+    /// behind it. `tearDown()` only runs on feature disable, so it is not a
+    /// substitute. A screen that comes back gets a fresh window from `ensureWindow`.
+    private func pruneDetachedScreens() {
+        let activeScreens = Set(NSScreen.screens)
+        volumeWindows = pruned(volumeWindows, activeScreens: activeScreens)
+        brightnessWindows = pruned(brightnessWindows, activeScreens: activeScreens)
+        backlightWindows = pruned(backlightWindows, activeScreens: activeScreens)
+    }
+
+    private func pruned(_ windows: [NSScreen: OSDWindow], activeScreens: Set<NSScreen>) -> [NSScreen: OSDWindow] {
+        var remaining = windows
+        for (screen, window) in windows where !activeScreens.contains(screen) {
+            remaining.removeValue(forKey: screen)
+            dispose(window)
+        }
+        return remaining
+    }
+
+    private func dispose(_ window: OSDWindow) {
+        window.nsWindow.orderOut(nil)
+        // Release the hosting view with the window; nothing else references it.
+        window.nsWindow.contentView = nil
     }
 }
 
