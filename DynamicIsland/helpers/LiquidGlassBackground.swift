@@ -26,6 +26,9 @@ private final class LiquidGlassContainerView: NSView {
 
     private var observedBackdropLayers: [CALayer] = []
     private var hasScheduledBackdropSetup = false
+    // Set while we write the backdrop properties ourselves. Our own writes fire the
+    // KVO observers below, and reacting to them would re-enter configureBackdropLayers.
+    private var isApplyingBackdropProperties = false
     private let windowServerAwareKeyPath = "windowServerAware"
     private let scaleKeyPath = "scale"
 
@@ -65,8 +68,15 @@ private final class LiquidGlassContainerView: NSView {
             return
         }
 
+        isApplyingBackdropProperties = true
         setBackdropProperties(in: rootLayer)
+        isApplyingBackdropProperties = false
+
         let newBackdropLayers = collectBackdropLayers(in: rootLayer)
+
+        // Re-registering identical observers on every layout pass churned two KVO
+        // registrations per backdrop layer per pass. The layer set almost never changes.
+        guard !isSameLayerSet(newBackdropLayers) else { return }
 
         removeBackdropObservers()
         observedBackdropLayers = newBackdropLayers
@@ -74,6 +84,11 @@ private final class LiquidGlassContainerView: NSView {
             backdrop.addObserver(self, forKeyPath: windowServerAwareKeyPath, options: [.old, .new], context: nil)
             backdrop.addObserver(self, forKeyPath: scaleKeyPath, options: [.old, .new], context: nil)
         }
+    }
+
+    private func isSameLayerSet(_ layers: [CALayer]) -> Bool {
+        layers.count == observedBackdropLayers.count
+            && zip(layers, observedBackdropLayers).allSatisfy { $0 === $1 }
     }
 
     private func setBackdropProperties(in layer: CALayer) {
@@ -99,14 +114,26 @@ private final class LiquidGlassContainerView: NSView {
         change: [NSKeyValueChangeKey: Any]?,
         context: UnsafeMutableRawPointer?
     ) {
+        // Our own writes in setBackdropProperties land here too; reacting to them
+        // would recurse straight back into configureBackdropLayers.
+        if isApplyingBackdropProperties, keyPath == windowServerAwareKeyPath || keyPath == scaleKeyPath {
+            return
+        }
+
         if keyPath == windowServerAwareKeyPath {
             if change?[.newKey] as? Bool == false {
-                configureBackdropLayers()
+                // Debounced, NOT a direct configureBackdropLayers() call. The window server
+                // resets this flag on its own schedule; answering each reset synchronously
+                // turned into an unthrottled write/reset ping-pong that burned a full core
+                // and allocated gigabytes of transient layer arrays and KVO metadata.
+                scheduleBackdropSetup()
             }
         } else if keyPath == scaleKeyPath {
             guard let layer = object as? CALayer else { return }
             if let newScale = (change?[.newKey] as? NSNumber)?.doubleValue, newScale != 1.0 {
+                isApplyingBackdropProperties = true
                 layer.setValue(1.0, forKey: scaleKeyPath)
+                isApplyingBackdropProperties = false
             }
         } else {
             super.observeValue(forKeyPath: keyPath, of: object, change: change, context: context)
