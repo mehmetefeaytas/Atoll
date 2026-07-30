@@ -74,6 +74,13 @@ struct RealTimeWaveformScrubberView: View {
                 .clipShape(RoundedRectangle(cornerRadius: minHeight / 2))
             }
         }
+        // Register as an AudioTap consumer for as long as this scrubber is on
+        // screen. Required independently of the closed-notch spectrum: the hover
+        // scrubber can be visible while no RealTimeAudioSpectrum view is mounted,
+        // and without a consumer AudioTap's magnitude timer stays gated off and the
+        // bars would sit flat.
+        .onAppear { AudioTap.shared.addVisualizerConsumer() }
+        .onDisappear { AudioTap.shared.removeVisualizerConsumer() }
     }
 }
 

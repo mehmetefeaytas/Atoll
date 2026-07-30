@@ -24,6 +24,7 @@ import AppKit
 import AudioToolbox
 import CoreAudio
 import simd
+import os
 import os.log
 
 private let audioTapLog = OSLog(subsystem: "com.atoll.dynamicisland", category: "AudioTap")
@@ -104,14 +105,33 @@ class AudioTap: NSObject {
     static let shared = AudioTap()
     
     let bridge = AudioBridge()
+    /// Gates the DSP work in the CoreAudio IOProc. Written on main (from the
+    /// consumer refcount below), read on the real-time thread — a single-byte
+    /// access, so the worst case is one stale buffer; deliberately not locked,
+    /// because taking a lock on the RT thread is far worse than that.
     var isPaused: Bool = false
     private var displayMagnitudes: [Float] = Array(repeating: 0, count: 6)
+    /// Preallocated destination for `copySmoothedMagnitudes` so the display-rate
+    /// timer does not allocate.
+    private var magnitudeScratch: [Float] = Array(repeating: 0, count: 6)
+
+    /// Number of mounted visualizer views. The 60 Hz timer below used to run
+    /// whenever capture was live — notch closed, no visualizer on screen, screen
+    /// asleep — burning main-thread time on magnitudes nobody rendered.
+    private var consumerCount = 0
 
     // CoreAudio stuff
     private var tapID: AudioObjectID = kAudioObjectUnknown
     private var aggregateDeviceID: AudioObjectID = kAudioObjectUnknown
     private var ioProcID: AudioDeviceIOProcID? = nil
     private var captureIsRunning = false
+    /// `captureIsRunning` mirrored for readers off `audioQueue` — the timer-arming
+    /// decision on the main thread needs it, and reading the plain `var` across
+    /// threads is a data race.
+    private let captureRunningFlag = OSAllocatedUnfairLock(initialState: false)
+    private var isCaptureRunning: Bool {
+        captureRunningFlag.withLock { $0 }
+    }
     private var updateTimer: Timer?
     
     // Serial queue to prevent race conditions
@@ -139,19 +159,75 @@ class AudioTap: NSObject {
     }
 
     @objc private func updateSmoothedMagnitudes() {
-        let nsMagnitudes = bridge.getSmoothedMagnitudes()
-        let targetLevels = nsMagnitudes.map { $0.floatValue }
-        
+        let written = magnitudeScratch.withUnsafeMutableBufferPointer { buffer in
+            Int(bridge.copySmoothedMagnitudes(buffer.baseAddress!, capacity: Int32(buffer.count)))
+        }
+
         let smoothingFactor: Float = 0.4
-        
-        for i in 0..<min(targetLevels.count, displayMagnitudes.count) {
-            let difference = targetLevels[i] - displayMagnitudes[i]
+
+        for i in 0..<min(written, displayMagnitudes.count) {
+            let difference = magnitudeScratch[i] - displayMagnitudes[i]
             displayMagnitudes[i] += difference * smoothingFactor
         }
     }
 
     func getSmoothedMagnitudes() -> [Float] {
         return displayMagnitudes
+    }
+
+    // MARK: - Visualizer consumers
+
+    /// Call when a view that renders `getSmoothedMagnitudes()` becomes visible.
+    /// Balanced by `removeVisualizerConsumer()`.
+    func addVisualizerConsumer() {
+        onMain {
+            self.consumerCount += 1
+            if self.consumerCount == 1 {
+                self.isPaused = false
+                self.startUpdateTimerIfNeeded()
+            }
+        }
+    }
+
+    func removeVisualizerConsumer() {
+        onMain {
+            self.consumerCount = max(0, self.consumerCount - 1)
+            guard self.consumerCount == 0 else { return }
+            // Stop the timer and gate the DSP, but deliberately leave the tap and
+            // aggregate device up: creating them is expensive, and startCaptureSync
+            // re-decides which processes to tap (including the Bluetooth/Spotify
+            // exclusion), so churning that on every view mount would destabilise
+            // the CoreAudio session.
+            self.isPaused = true
+            self.updateTimer?.invalidate()
+            self.updateTimer = nil
+            self.displayMagnitudes = Array(repeating: 0, count: self.displayMagnitudes.count)
+        }
+    }
+
+    /// Always asynchronous, never inline-on-main.
+    ///
+    /// A mixed inline/async hop would not be FIFO across threads: an off-main
+    /// release (a view deallocated on a background thread) would be deferred while a
+    /// main-thread acquire ran inline before it, so the decrement could land last and
+    /// gate the timer off while a visualizer is still mounted.
+    private func onMain(_ work: @escaping () -> Void) {
+        DispatchQueue.main.async(execute: work)
+    }
+
+    private func startUpdateTimerIfNeeded() {
+        guard updateTimer == nil, isCaptureRunning, consumerCount > 0 else { return }
+        let timer = Timer(
+            timeInterval: 1.0 / 60.0,
+            target: self,
+            selector: #selector(updateSmoothedMagnitudes),
+            userInfo: nil,
+            repeats: true
+        )
+        // Let the OS coalesce these with other main-runloop work.
+        timer.tolerance = 1.0 / 120.0
+        RunLoop.main.add(timer, forMode: .common)
+        updateTimer = timer
     }
 
     func startCapture() async {
@@ -272,13 +348,18 @@ class AudioTap: NSObject {
         }
 
         captureIsRunning = true
+        captureRunningFlag.withLock { $0 = true }
         callbackCount = 0
         
         DispatchQueue.main.async { [weak self] in
-            self?.updateTimer?.invalidate()
-            let timer = Timer(timeInterval: 1.0 / 60.0, target: self as Any, selector: #selector(self?.updateSmoothedMagnitudes), userInfo: nil, repeats: true)
-            RunLoop.main.add(timer, forMode: .common)
-            self?.updateTimer = timer
+            guard let self else { return }
+            self.updateTimer?.invalidate()
+            self.updateTimer = nil
+            // A capture that comes up with nothing mounted stays gated; the timer
+            // is armed by addVisualizerConsumer() when a view appears. A view that
+            // stayed mounted across restartCapture() re-arms it here.
+            self.isPaused = self.consumerCount == 0
+            self.startUpdateTimerIfNeeded()
         }
         
         print("🟢 [AudioTap] CoreAudio CATap flowing through Aggregate Device!")
@@ -350,6 +431,7 @@ class AudioTap: NSObject {
         aggregateDeviceID = kAudioObjectUnknown
         ioProcID = nil
         captureIsRunning = false
+        captureRunningFlag.withLock { $0 = false }
         
         DispatchQueue.main.async { [weak self] in
             self?.updateTimer?.invalidate()

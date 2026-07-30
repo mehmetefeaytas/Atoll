@@ -26,7 +26,11 @@ NS_ASSUME_NONNULL_BEGIN
 @interface AudioBridge : NSObject
 
 - (void)processBuffer:(const float *)buffer count:(int)count;
-- (NSArray<NSNumber *> *)getSmoothedMagnitudes;
+/// Copies up to `capacity` band magnitudes into `outBuffer`, returning how many
+/// were written. Replaces an `NSArray<NSNumber *>` accessor that boxed every band
+/// on every call — this runs on a display-rate timer, so that was ~120 heap
+/// allocations per second on the main thread.
+- (int)copySmoothedMagnitudes:(float *)outBuffer capacity:(int)capacity;
 - (int)getBandCount;
 
 @end

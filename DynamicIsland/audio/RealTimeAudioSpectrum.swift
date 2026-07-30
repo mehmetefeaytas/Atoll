@@ -30,6 +30,11 @@ class RealTimeAudioSpectrum: NSView {
     private var barLayers: [CAShapeLayer] = []
     private var isPlaying: Bool = true
     private var animationTimer: Timer?
+    /// Tracks whether we currently hold an AudioTap consumer slot, so acquire and
+    /// release stay balanced: startAnimating()/stopAnimating() are each reachable
+    /// from several paths (viewDidMoveToWindow, setPlaying, deinit) and may be
+    /// called twice in a row.
+    private var isTapConsumer = false
     
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -81,7 +86,25 @@ class RealTimeAudioSpectrum: NSView {
         }
     }
 
+    private func acquireTap() {
+        guard !isTapConsumer else { return }
+        isTapConsumer = true
+        AudioTap.shared.addVisualizerConsumer()
+    }
+
+    private func releaseTap() {
+        guard isTapConsumer else { return }
+        isTapConsumer = false
+        AudioTap.shared.removeVisualizerConsumer()
+    }
+
     private func startAnimating() {
+        // `setPlaying(_:)` is called unconditionally from makeNSView/updateNSView, so
+        // without this an off-window view could un-gate the CoreAudio DSP and start a
+        // 30fps timer after viewDidMoveToWindow(nil). viewDidMoveToWindow re-enters
+        // here once the view is actually in a window.
+        guard window != nil else { return }
+        acquireTap()
         guard animationTimer == nil else { return }
         // Use a timer at ~30fps for smooth animation.
         // The timer only runs while the view is in a window (see viewDidMoveToWindow)
@@ -94,51 +117,42 @@ class RealTimeAudioSpectrum: NSView {
     }
     
     private func stopAnimating() {
+        releaseTap()
         animationTimer?.invalidate()
         animationTimer = nil
         resetBars()
     }
-    
-    private var debugLogCounter = 0
     
     private func updateBarsFromAudio() {
         guard isPlaying else {
             resetBars()
             return
         }
-        
+
         // Get real-time magnitudes from AudioTap
         let magnitudes = AudioTap.shared.getSmoothedMagnitudes()
-        
-        // Debug: log magnitudes periodically
-        debugLogCounter += 1
-        if debugLogCounter % 60 == 0 { // Every 2 seconds at 30fps
-            if magnitudes.count >= 4 {
-                print("📊 [Spectrum] Magnitudes: [\(magnitudes[0]), \(magnitudes[1]), \(magnitudes[2]), \(magnitudes[3])]")
-            }
-        }
-        
-        // Update each bar with its corresponding band magnitude
+
+        // One transaction around the whole loop rather than per bar: this runs at
+        // 30fps, and each begin/commit pair is CoreAnimation bookkeeping.
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
         for (index, barLayer) in barLayers.enumerated() {
             guard index < magnitudes.count else { break }
             let magnitude = magnitudes[index]
             // Map magnitude (0-1) to scale (0.2 - 1.0) for visual appeal
             let scale = max(0.2, min(1.0, CGFloat(magnitude) * 1.5 + 0.2))
-            
-            CATransaction.begin()
-            CATransaction.setDisableActions(true)
             barLayer.transform = CATransform3DMakeScale(1, scale, 1)
-            CATransaction.commit()
         }
+        CATransaction.commit()
     }
-    
+
     private func resetBars() {
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
         for barLayer in barLayers {
-            CATransaction.begin()
-            CATransaction.setDisableActions(true)
             barLayer.transform = CATransform3DMakeScale(1, 0.2, 1)
-            CATransaction.commit()
         }
+        CATransaction.commit()
     }
     
     func setPlaying(_ playing: Bool) {

@@ -38,13 +38,18 @@
     processor->process(buffer, count);
 }
 
-- (NSArray<NSNumber *> *)getSmoothedMagnitudes {
-    int count = processor->getBandCount();
-    NSMutableArray<NSNumber *> *magnitudes = [NSMutableArray arrayWithCapacity:count];
-    for (int i = 0; i < count; i++) {
-        [magnitudes addObject:@(processor->getBand(i))];
+- (int)copySmoothedMagnitudes:(float *)outBuffer capacity:(int)capacity {
+    if (outBuffer == NULL || capacity <= 0) {
+        return 0;
     }
-    return magnitudes;
+    int count = processor->getBandCount();
+    if (count > capacity) {
+        count = capacity;
+    }
+    for (int i = 0; i < count; i++) {
+        outBuffer[i] = processor->getBand(i);
+    }
+    return count;
 }
 
 - (int)getBandCount {
