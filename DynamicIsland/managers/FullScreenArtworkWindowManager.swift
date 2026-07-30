@@ -224,7 +224,7 @@ private struct FullScreenLyricsOverlayContent: View {
     let fontSize: CGFloat
 
     private var isPlaceholder: Bool {
-        text == "Loading lyrics..." || text == "No lyrics found"
+        LyricsPlaceholder.matches(text)
     }
 
     var body: some View {

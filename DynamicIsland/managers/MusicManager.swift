@@ -38,6 +38,26 @@ struct LyricLine: Identifiable, Codable {
     }
 }
 
+/// Distinguishes "the provider answered, this track has none" from "the lookup
+/// itself failed". Only the former may be cached.
+enum LyricsFetchError: Error {
+    case serviceUnavailable(Int)
+}
+
+/// Status text shown in place of real lyrics. Centralised because the full-screen
+/// overlay dims placeholders by comparing the displayed string against these —
+/// a check that silently breaks as soon as the text is localized or a new status
+/// is added.
+enum LyricsPlaceholder {
+    static var loading: String { String(localized: "Loading lyrics...") }
+    static var notFound: String { String(localized: "No lyrics found") }
+    static var unavailable: String { String(localized: "Lyrics unavailable") }
+
+    static func matches(_ text: String) -> Bool {
+        text == loading || text == notFound || text == unavailable
+    }
+}
+
 private struct LyricsLookupKey: Hashable {
     let title: String
     let artist: String
@@ -1383,7 +1403,7 @@ class MusicManager: ObservableObject {
         if trackChanged {
             syncedLyrics = []
             currentLyricIndex = -1
-            currentLyrics = shouldShowLoading ? "Loading lyrics..." : ""
+            currentLyrics = shouldShowLoading ? LyricsPlaceholder.loading : ""
             stopLyricSync()
         }
 
@@ -1394,7 +1414,7 @@ class MusicManager: ObservableObject {
 
         if lyricsFetchKey == key {
             if shouldShowLoading && syncedLyrics.isEmpty {
-                currentLyrics = "Loading lyrics..."
+                currentLyrics = LyricsPlaceholder.loading
             }
             return
         }
@@ -1403,7 +1423,7 @@ class MusicManager: ObservableObject {
         lyricsFetchKey = key
 
         if shouldShowLoading || (lyricsEnabled && syncedLyrics.isEmpty) {
-            currentLyrics = "Loading lyrics..."
+            currentLyrics = LyricsPlaceholder.loading
         }
 
         let requestArtist = lookup.requestArtist
@@ -1430,13 +1450,16 @@ class MusicManager: ObservableObject {
                 }
             } catch {
                 print("Failed to fetch lyrics: \(error)")
+                // Deliberately NOT cached: the lookup failed, so the next attempt for
+                // this track must hit the network again once the provider recovers.
+                let failedOutright = !(error is CancellationError)
                 await MainActor.run {
                     guard self.activeLyricsKey == key else { return }
                     self.lyricsFetchKey = nil
                     self.lyricsFetchTask = nil
                     self.syncedLyrics = []
                     self.currentLyricIndex = -1
-                    self.currentLyrics = lyricsEnabled ? "No lyrics found" : ""
+                    self.currentLyrics = lyricsEnabled && failedOutright ? LyricsPlaceholder.unavailable : ""
                     self.stopLyricSync()
                 }
             }
@@ -1459,7 +1482,13 @@ class MusicManager: ObservableObject {
         let urlString = "https://lrclib.net/api/search?track_name=\(encodedTitle)&artist_name=\(encodedArtist)"
         guard let url = URL(string: urlString) else { return [] }
 
-        let (data, response) = try await URLSession.shared.data(from: url)
+        // LRCLIB asks clients to identify themselves, and the shared session's default
+        // 60 s timeout meant every track stalled for a minute while the API was down.
+        var request = URLRequest(url: url, timeoutInterval: 12)
+        let appVersion = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "?"
+        request.setValue("Atoll/\(appVersion) (macOS)", forHTTPHeaderField: "User-Agent")
+
+        let (data, response) = try await URLSession.shared.data(for: request)
         if let http = response as? HTTPURLResponse, http.statusCode == 200 {
             // Try parse as array JSON (preferred)
             if let jsonArray = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]],
@@ -1502,7 +1531,10 @@ class MusicManager: ObservableObject {
                 return []
             }
         } else {
-            return []
+            // A 429 or 504 from LRCLIB is NOT the same answer as "this track has no
+            // lyrics". Returning [] here let the caller cache the miss, so a track
+            // stayed permanently blank even after the service recovered.
+            throw LyricsFetchError.serviceUnavailable((response as? HTTPURLResponse)?.statusCode ?? -1)
         }
     }
 
@@ -1588,7 +1620,7 @@ class MusicManager: ObservableObject {
         currentLyricIndex = -1
 
         guard !lyrics.isEmpty else {
-            currentLyrics = Defaults[.enableLyrics] ? "No lyrics found" : ""
+            currentLyrics = Defaults[.enableLyrics] ? LyricsPlaceholder.notFound : ""
             stopLyricSync()
             return
         }
@@ -1725,7 +1757,7 @@ class MusicManager: ObservableObject {
         // show a loading placeholder and start fetching asynchronously.
         if showLyrics && syncedLyrics.isEmpty {
             // Provide immediate feedback so the UI can show a loading state.
-            currentLyrics = "Loading lyrics..."
+            currentLyrics = LyricsPlaceholder.loading
 
             Task {
                 await fetchLyrics()
@@ -1733,7 +1765,7 @@ class MusicManager: ObservableObject {
                 // If fetch completed but no lyrics were found, show a friendly message.
                 await MainActor.run {
                     if self.syncedLyrics.isEmpty && self.currentLyrics.isEmpty {
-                        self.currentLyrics = "No lyrics found"
+                        self.currentLyrics = LyricsPlaceholder.notFound
                     }
                 }
             }
