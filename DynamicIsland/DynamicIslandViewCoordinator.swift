@@ -158,14 +158,18 @@ class DynamicIslandViewCoordinator: ObservableObject {
     
     @AppStorage("hudReplacement") var hudReplacement: Bool = true
     
-    @AppStorage("preferred_screen_name") var preferredScreen = NSScreen.main?.localizedName ?? "Unknown" {
+    // Defaults to the primary display, not `NSScreen.main`: the latter tracks
+    // the key window / pointer, so until the user picked a screen explicitly
+    // this default was recomputed per launch and the notch could land on an
+    // external monitor just because the pointer was there at startup.
+    @AppStorage("preferred_screen_name") var preferredScreen = NSScreen.primary?.localizedName ?? "Unknown" {
         didSet {
             selectedScreen = preferredScreen
             NotificationCenter.default.post(name: Notification.Name.selectedScreenChanged, object: nil)
         }
     }
-    
-    @Published var selectedScreen: String = NSScreen.main?.localizedName ?? "Unknown"
+
+    @Published var selectedScreen: String = NSScreen.primary?.localizedName ?? "Unknown"
 
     @Published var optionKeyPressed: Bool = true
     private let extensionNotchExperienceManager = ExtensionNotchExperienceManager.shared
