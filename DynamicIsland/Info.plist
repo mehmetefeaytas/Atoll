@@ -13,6 +13,10 @@
 	<string>Atoll needs audio capture permission to display the real-time music waveform visualizer.</string>
 	<key>NSScreenCaptureUsageDescription</key>
 	<string>Atoll needs screen recording permission to capture screenshots for the AI assistant feature.</string>
+	<key>SUAutomaticallyUpdate</key>
+	<false/>
+	<key>SUEnableAutomaticChecks</key>
+	<false/>
 	<key>SUEnableDownloaderService</key>
 	<true/>
 	<key>SUEnableInstallerLauncherService</key>
